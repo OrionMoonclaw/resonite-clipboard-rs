@@ -1,118 +1,312 @@
+use anyhow::Result;
+use anyhow::anyhow;
+
+use clipboard_rs::{Clipboard, ClipboardContext};
 use std::ffi::{CStr, c_char, c_uchar};
 use std::io::Read;
 use std::ptr::null;
 use std::slice;
-
+use std::sync::{Mutex, OnceLock};
 use wl_clipboard_rs::copy::{self, Options};
 use wl_clipboard_rs::paste::{self, ClipboardType, Seat, get_contents, get_mime_types};
 
-#[unsafe(no_mangle)]
-pub extern "C" fn copy_auto(data: *const c_uchar, data_length: u32) {
-    let data_array = unsafe { slice::from_raw_parts(data, data_length.try_into().unwrap()) };
+static CLIPBOARD_CTX: OnceLock<Mutex<Result<ClipboardContext>>> = OnceLock::new();
+
+fn get_clipboard_ctx()
+-> Result<std::sync::MutexGuard<'static, Result<ClipboardContext, anyhow::Error>>> {
+    CLIPBOARD_CTX
+        .get_or_init(|| Mutex::new(ClipboardContext::new().map_err(|e| anyhow::anyhow!(e))))
+        .lock()
+        .map_err(|e| anyhow!("failed to lock clipboard context: {e}"))
+}
+
+fn copy_auto_impl(data: &[u8]) -> Result<()> {
     match Options::new().copy(
-        wl_clipboard_rs::copy::Source::Bytes(data_array.into()),
+        wl_clipboard_rs::copy::Source::Bytes(data.into()),
         copy::MimeType::Autodetect,
     ) {
-        Ok(_) => println!("copy success"),
-        Err(_) => todo!("copy failure"),
+        Ok(_) => return Ok(()),
+        Err(e) => eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}"),
     }
+
+    let mime_type = infer::get(data)
+        .map(|k| k.mime_type())
+        .unwrap_or("application/octet-stream");
+
+    let mut ctx_guard = get_clipboard_ctx()?;
+    let ctx = ctx_guard
+        .as_mut()
+        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+
+    ctx.set_buffer(mime_type, data.to_vec())
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn copy_text(data: *const c_char) {
-    let data_cstr = unsafe { CStr::from_ptr(data) };
+fn copy_text_impl(text: String) -> Result<()> {
     match Options::new().copy(
-        wl_clipboard_rs::copy::Source::Bytes(Box::from(data_cstr.to_bytes())),
-        copy::MimeType::Text,
+        wl_clipboard_rs::copy::Source::Bytes(text.clone().into_bytes().into()),
+        copy::MimeType::Autodetect,
     ) {
-        Ok(_) => println!("copy success"),
-        Err(_) => todo!("copy failure"),
+        Ok(_) => return Ok(()),
+        Err(e) => eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}"),
+    }
+
+    let mut ctx_guard = get_clipboard_ctx()?;
+    let ctx = ctx_guard
+        .as_mut()
+        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+
+    ctx.set_text(text).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
+}
+
+fn copy_with_type_impl(data: &[u8], mime_type: &str) -> Result<()> {
+    match Options::new().copy(
+        wl_clipboard_rs::copy::Source::Bytes(data.into()),
+        copy::MimeType::Specific(mime_type.to_string()),
+    ) {
+        Ok(_) => return Ok(()),
+        Err(e) => eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}"),
+    }
+
+    let mut ctx_guard = get_clipboard_ctx()?;
+    let ctx = ctx_guard
+        .as_mut()
+        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+
+    ctx.set_buffer(mime_type, data.to_vec())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
+}
+
+fn available_mime_types_impl() -> Result<Vec<u8>> {
+    match get_mime_types(ClipboardType::Regular, Seat::Unspecified) {
+        Ok(t) => {
+            let concatenated = t.into_iter().fold(String::new(), |mut acc, t| {
+                acc.push_str(&t);
+                acc.push('\n');
+                acc
+            });
+            return Ok(concatenated.into_bytes());
+        }
+        Err(e) => eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}"),
+    }
+
+    let mut ctx_guard = get_clipboard_ctx()?;
+    let ctx = ctx_guard
+        .as_mut()
+        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+
+    let mut formats = ctx.available_formats().map_err(|e| anyhow::anyhow!(e))?;
+
+    // Resonite checks for this specific mime type and without it won't try to get text
+    if formats.iter().any(|f| f == "UTF8_STRING") {
+        formats.push("text/plain;charset=utf-8".to_string());
+    }
+    let concatenated = formats.join("\n") + "\n";
+    Ok(concatenated.into_bytes())
+}
+
+fn paste_with_type_impl(mime_type: &str) -> Result<Vec<u8>> {
+    match get_contents(
+        ClipboardType::Regular,
+        Seat::Unspecified,
+        paste::MimeType::Specific(mime_type),
+    ) {
+        Ok((mut p, _)) => {
+            let mut contents = Vec::new();
+            match p.read_to_end(&mut contents) {
+                Ok(_) => {
+                    return Ok(contents);
+                }
+                Err(e) => {
+                    eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}")
+                }
+            }
+        }
+        Err(e) => eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}"),
+    }
+
+    let mut ctx_guard = get_clipboard_ctx()?;
+    let ctx = ctx_guard
+        .as_mut()
+        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+
+    let buf = ctx.get_buffer(mime_type).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(buf)
+}
+
+fn paste_auto_impl() -> Result<Vec<u8>> {
+    match get_contents(
+        ClipboardType::Regular,
+        Seat::Unspecified,
+        paste::MimeType::Any,
+    ) {
+        Ok((mut p, _)) => {
+            let mut contents = Vec::new();
+            match p.read_to_end(&mut contents) {
+                Ok(_) => {
+                    return Ok(contents);
+                }
+                Err(e) => {
+                    eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}")
+                }
+            }
+        }
+        Err(e) => eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}"),
+    }
+
+    let mut ctx_guard = get_clipboard_ctx()?;
+    let ctx = ctx_guard
+        .as_mut()
+        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+
+    let formats = ctx.available_formats().map_err(|e| anyhow::anyhow!(e))?;
+    let first = formats
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no formats available"))?;
+    let buf = ctx.get_buffer(first).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(buf)
+}
+
+fn paste_text_impl() -> Result<Vec<u8>> {
+    match get_contents(
+        ClipboardType::Regular,
+        Seat::Unspecified,
+        paste::MimeType::Text,
+    ) {
+        Ok((mut p, _)) => {
+            let mut contents = Vec::new();
+            match p.read_to_end(&mut contents) {
+                Ok(_) => {
+                    return Ok(contents);
+                }
+                Err(e) => {
+                    eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}")
+                }
+            }
+        }
+        Err(e) => eprintln!("falling back to clipboard_rs, wl-clipboard-rs failed with error {e}"),
+    }
+
+    let mut ctx_guard = get_clipboard_ctx()?;
+    let ctx = ctx_guard
+        .as_mut()
+        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+
+    let text = ctx.get_text().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(text.into_bytes())
+}
+
+fn alloc_and_copy(bytes: &[u8]) -> (*const c_uchar, usize) {
+    let allocated = unsafe { libc::malloc(bytes.len()) };
+    if allocated.is_null() {
+        return (null(), 0);
+    }
+
+    unsafe {
+        slice::from_raw_parts_mut(allocated as *mut u8, bytes.len()).copy_from_slice(bytes);
+    }
+
+    (allocated as *const c_uchar, bytes.len())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copy_auto(data: *const c_uchar, data_length: u32) {
+    let data_array = unsafe { slice::from_raw_parts(data, data_length as usize) };
+    if let Err(e) = copy_auto_impl(data_array) {
+        eprintln!("copy_auto error: {e}");
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn copy_with_type(
+pub unsafe extern "C" fn copy_text(data: *const c_char) {
+    let data_cstr = unsafe { CStr::from_ptr(data) };
+    let text = data_cstr.to_string_lossy().to_string();
+    if let Err(e) = copy_text_impl(text) {
+        eprintln!("copy_text error: {e}");
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copy_with_type(
     data: *const c_uchar,
     data_length: u32,
     mime_type_raw: *const c_char,
 ) {
-    let a = unsafe { slice::from_raw_parts(data, data_length.try_into().unwrap()) };
-    let mime_type_cstr = unsafe { CStr::from_ptr(mime_type_raw) };
-    let mime_type = match mime_type_cstr.to_str() {
-        Ok(s) => copy::MimeType::Specific(s.to_string()),
-        Err(_) => copy::MimeType::Autodetect,
-    };
-    match Options::new().copy(wl_clipboard_rs::copy::Source::Bytes(a.into()), mime_type) {
-        Ok(_) => println!("copy success"),
-        Err(_) => todo!("copy failure"),
+    let data_slice = unsafe { slice::from_raw_parts(data, data_length as usize) };
+    let mime_type = unsafe { CStr::from_ptr(mime_type_raw).to_string_lossy() };
+    if let Err(e) = copy_with_type_impl(data_slice, &mime_type) {
+        eprintln!("copy_with_type error: {e}");
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn available_mime_types(size: *mut u32) -> *const c_uchar {
-    let mime_types = match get_mime_types(ClipboardType::Regular, Seat::Unspecified) {
-        Ok(t) => t,
-        Err(_) => {
-            println!("get mime types failure");
-            return null();
+pub unsafe extern "C" fn available_mime_types(size: *mut u32) -> *const c_uchar {
+    match available_mime_types_impl() {
+        Ok(bytes) => {
+            unsafe { size.write(bytes.len() as u32) };
+            let (ptr, _) = alloc_and_copy(&bytes);
+            ptr
         }
-    };
-    let concatenated = mime_types.into_iter().fold("".to_string(), |mut acc, t| {
-        acc.push_str(&t);
-        acc.push('\n');
-        acc
-    });
-    unsafe { size.write(concatenated.len().try_into().unwrap()) }
-    let allocated = unsafe { libc::malloc(concatenated.len()) };
-    let allocated_slice = unsafe {
-        std::slice::from_raw_parts_mut::<u8>(allocated.cast(), concatenated.as_bytes().len())
-    };
-    allocated_slice.copy_from_slice(concatenated.as_bytes());
-    allocated.cast()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn paste_with_type(mime_type_raw: *const c_char, size: *mut u32) -> *const c_uchar {
-    let mime_type_cstr = unsafe { CStr::from_ptr(mime_type_raw) };
-    let mime_type = match mime_type_cstr.to_str() {
-        Ok(s) => paste::MimeType::Specific(s),
-        Err(_) => paste::MimeType::Any,
-    };
-    let (result, length) = paste(mime_type);
-    unsafe { size.write(length.try_into().unwrap()) }
-    result
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn paste_auto(size: *mut u32) -> *const c_uchar {
-    let (result, length) = paste(paste::MimeType::Any);
-    unsafe { size.write(length.try_into().unwrap()) }
-    result
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn paste_text(size: *mut u32) -> *const c_uchar {
-    let (result, length) = paste(paste::MimeType::Text);
-    unsafe { size.write(length.try_into().unwrap()) }
-    result
-}
-
-fn paste(mime_type: paste::MimeType) -> (*const c_uchar, usize) {
-    match get_contents(ClipboardType::Regular, Seat::Unspecified, mime_type) {
-        Ok((mut p, _)) => {
-            let mut contents = vec![];
-            match p.read_to_end(&mut contents) {
-                Ok(_) => {
-                    let allocated = unsafe { libc::malloc(contents.len()) };
-                    let allocated_slice = unsafe {
-                        std::slice::from_raw_parts_mut::<u8>(allocated.cast(), contents.len())
-                    };
-                    allocated_slice.copy_from_slice(&contents);
-                    (allocated.cast(), contents.len())
-                }
-                Err(_) => todo!("paste failure"),
-            }
+        Err(e) => {
+            eprintln!("available_mime_types error: {e}");
+            unsafe { size.write(0) };
+            null()
         }
-        Err(_) => todo!("paste failure"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paste_with_type(
+    mime_type_raw: *const c_char,
+    size: *mut u32,
+) -> *const c_uchar {
+    let mime_type = unsafe { CStr::from_ptr(mime_type_raw).to_string_lossy() };
+    match paste_with_type_impl(&mime_type) {
+        Ok(buf) => {
+            let (ptr, len) = alloc_and_copy(&buf);
+            unsafe { size.write(len as u32) };
+            ptr
+        }
+        Err(e) => {
+            eprintln!("paste_with_type error: {e}");
+            unsafe { size.write(0) };
+            null()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paste_auto(size: *mut u32) -> *const c_uchar {
+    match paste_auto_impl() {
+        Ok(buf) => {
+            let (ptr, len) = alloc_and_copy(&buf);
+            unsafe { size.write(len as u32) };
+            ptr
+        }
+        Err(e) => {
+            eprintln!("paste_auto error: {e}");
+            unsafe { size.write(0) };
+            null()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paste_text(size: *mut u32) -> *const c_uchar {
+    match paste_text_impl() {
+        Ok(buf) => {
+            let (ptr, len) = alloc_and_copy(&buf);
+            unsafe { size.write(len as u32) };
+            ptr
+        }
+        Err(e) => {
+            eprintln!("paste_text error: {e}");
+            unsafe { size.write(0) };
+            null()
+        }
     }
 }
