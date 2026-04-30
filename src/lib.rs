@@ -1,23 +1,23 @@
-use anyhow::Result;
-use anyhow::anyhow;
-
 use clipboard_rs::{Clipboard, ClipboardContext};
 use std::ffi::{CStr, c_char, c_uchar};
 use std::ptr::null;
 use std::slice;
 use std::sync::{Mutex, OnceLock};
 
+type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+type Result<T> = std::result::Result<T, Error>;
+
 static CLIPBOARD_CTX: OnceLock<Mutex<Result<ClipboardContext>>> = OnceLock::new();
 
 fn get_clipboard_ctx()
--> Result<std::sync::MutexGuard<'static, Result<ClipboardContext, anyhow::Error>>> {
+-> clipboard_rs::Result<std::sync::MutexGuard<'static, clipboard_rs::Result<ClipboardContext>>> {
     CLIPBOARD_CTX
-        .get_or_init(|| Mutex::new(ClipboardContext::new().map_err(|e| anyhow::anyhow!(e))))
+        .get_or_init(|| Mutex::new(ClipboardContext::new()))
         .lock()
-        .map_err(|e| anyhow!("failed to lock clipboard context: {e}"))
+        .map_err(|e| format!("failed to lock clipboard context: {e}").into())
 }
 
-fn copy_auto_impl(data: &[u8]) -> Result<()> {
+fn copy_auto_impl(data: &[u8]) -> clipboard_rs::Result<()> {
     let mime_type = infer::get(data)
         .map(|k| k.mime_type())
         .unwrap_or("application/octet-stream");
@@ -25,44 +25,37 @@ fn copy_auto_impl(data: &[u8]) -> Result<()> {
     let mut ctx_guard = get_clipboard_ctx()?;
     let ctx = ctx_guard
         .as_mut()
-        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+        .map_err(|e| format!("clipboard context error: {e}"))?;
 
     ctx.set_buffer(mime_type, data.to_vec())
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    Ok(())
 }
 
-fn copy_text_impl(text: String) -> Result<()> {
+fn copy_text_impl(text: String) -> clipboard_rs::Result<()> {
     let mut ctx_guard = get_clipboard_ctx()?;
     let ctx = ctx_guard
         .as_mut()
-        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+        .map_err(|e| format!("clipboard context error: {e}"))?;
 
-    ctx.set_text(text).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(())
+    ctx.set_text(text)
 }
 
-fn copy_with_type_impl(data: &[u8], mime_type: &str) -> Result<()> {
+fn copy_with_type_impl(data: &[u8], mime_type: &str) -> clipboard_rs::Result<()> {
     let mut ctx_guard = get_clipboard_ctx()?;
     let ctx = ctx_guard
         .as_mut()
-        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+        .map_err(|e| format!("clipboard context error: {e}"))?;
 
     ctx.set_buffer(mime_type, data.to_vec())
-        .map_err(|e| anyhow::anyhow!(e))?;
-    Ok(())
 }
 
-fn available_mime_types_impl() -> Result<Vec<u8>> {
+fn available_mime_types_impl() -> clipboard_rs::Result<Vec<u8>> {
     let mut ctx_guard = get_clipboard_ctx()?;
     let ctx = ctx_guard
         .as_mut()
-        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+        .map_err(|e| format!("clipboard context error: {e}"))?;
 
-    let mut formats = ctx.available_formats().map_err(|e| anyhow::anyhow!(e))?;
+    let mut formats = ctx.available_formats()?;
 
-    // Resonite checks for this specific mime type and without it won't try to get text
     if formats.iter().any(|f| f == "UTF8_STRING") {
         formats.push("text/plain;charset=utf-8".to_string());
     }
@@ -70,38 +63,33 @@ fn available_mime_types_impl() -> Result<Vec<u8>> {
     Ok(concatenated.into_bytes())
 }
 
-fn paste_with_type_impl(mime_type: &str) -> Result<Vec<u8>> {
+fn paste_with_type_impl(mime_type: &str) -> clipboard_rs::Result<Vec<u8>> {
     let mut ctx_guard = get_clipboard_ctx()?;
     let ctx = ctx_guard
         .as_mut()
-        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+        .map_err(|e| format!("clipboard context error: {e}"))?;
 
-    let buf = ctx.get_buffer(mime_type).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(buf)
+    ctx.get_buffer(mime_type)
 }
 
-fn paste_auto_impl() -> Result<Vec<u8>> {
+fn paste_auto_impl() -> clipboard_rs::Result<Vec<u8>> {
     let mut ctx_guard = get_clipboard_ctx()?;
     let ctx = ctx_guard
         .as_mut()
-        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+        .map_err(|e| format!("clipboard context error: {e}"))?;
 
-    let formats = ctx.available_formats().map_err(|e| anyhow::anyhow!(e))?;
-    let first = formats
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no formats available"))?;
-    let buf = ctx.get_buffer(first).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(buf)
+    let formats = ctx.available_formats()?;
+    let first = formats.first().ok_or("no formats available")?;
+    ctx.get_buffer(first)
 }
 
-fn paste_text_impl() -> Result<Vec<u8>> {
+fn paste_text_impl() -> clipboard_rs::Result<Vec<u8>> {
     let mut ctx_guard = get_clipboard_ctx()?;
     let ctx = ctx_guard
         .as_mut()
-        .map_err(|e| anyhow!("clipboard context error: {e}"))?;
+        .map_err(|e| format!("clipboard context error: {e}"))?;
 
-    let text = ctx.get_text().map_err(|e| anyhow::anyhow!(e))?;
-    Ok(text.into_bytes())
+    ctx.get_text().map(String::into_bytes)
 }
 
 fn alloc_and_copy(bytes: &[u8]) -> (*const c_uchar, usize) {
